@@ -59,6 +59,20 @@
 <h1>LangGraph Routing Flow — Reference Notes</h1>
 <p><em>File: <code>langraph_with_multiple_tool.py</code></em></p>
 
+<div class="note">
+    <strong>Core distinction (keep this in mind while reading everything below):</strong>
+    <ul>
+        <li><strong>LangGraph decides <em>which node(s)</em> get executed</strong> &mdash; it owns node
+            execution and routing: calling node functions, evaluating conditional edges (via your
+            <code>route_next</code>), following fixed edges, and deciding what runs next.</li>
+        <li><strong>State is just data that gets passed to each node</strong> &mdash; it is not a control
+            mechanism by itself. <code>state</code> (including fields like <code>next_step</code>) only
+            influences routing when <em>your own code</em> (e.g. <code>route_next</code>) chooses to read a
+            field and returns a decision based on it. LangGraph never inspects state contents on its own; it
+            only inspects the <em>return value</em> of the router function you registered.</li>
+    </ul>
+</div>
+
 <h2>1. Corrected Routing Flow</h2>
 <ol>
     <li><code>agent_node</code> runs, the LLM requests a tool (e.g. <code>search_documents</code>), and the node returns
@@ -185,6 +199,240 @@ flowchart TD
 
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
 <script>mermaid.initialize({ startOnLoad: true });</script>
+
+<h2>5. How the Multi-Tool Loop Actually Works (IMPORTANT)</h2>
+<p>
+    A conditional edge is attached to the <strong>node</strong>, not to a single execution. Every single time
+    <code>agent_node</code> finishes running &mdash; no matter how many times it's re-entered in a loop &mdash;
+    LangGraph re-evaluates <code>route_next(state)</code> fresh, using whatever <code>state["next_step"]</code>
+    is <em>at that moment</em>. The same conditional-edge configuration is reused every cycle; it is never
+    "used up" after firing once.
+</p>
+
+<h3>The graph shape (a cycle, not a straight line)</h3>
+<pre>                 ┌──────────────────────────────────────────┐
+                 │                                            │
+ START ──▶ agent_node ──(conditional: route_next)──▶ search_documents_node ──▶ (back to agent_node)
+                 │                                            
+                 ├──(conditional: route_next)──▶ search_database_node ──▶ (back to agent_node)
+                 │
+                 ├──(conditional: route_next)──▶ web_search_node ──▶ (back to agent_node)
+                 │
+                 └──(conditional: route_next)──▶ END</pre>
+<p>
+    <code>add_conditional_edges("agent_node", route_next, {...})</code> is registered <strong>once</strong> in
+    the code, but it's a permanent property of the <code>agent_node</code> node — LangGraph calls
+    <code>route_next</code> every time <code>agent_node</code> completes, regardless of which
+    iteration/loop count it is.
+</p>
+
+<h3>Trace: web_search first, then search_documents</h3>
+<p><strong>Iteration 1</strong></p>
+<ol>
+    <li><code>agent_node</code> runs &rarr; LLM decides it needs <code>web_search</code> first &rarr;
+        <code>next_step = "web_search"</code>.</li>
+    <li>LangGraph calls <code>route_next(state)</code> &rarr; <code>choice == "web_search"</code> &rarr;
+        returns <code>"route_web"</code>.</li>
+    <li>Path map: <code>"route_web"</code> &rarr; <code>"web_search_node"</code>.</li>
+    <li><code>web_search_node</code> (i.e. <code>_run_tool_node(state, "web_search")</code>) runs, appends a
+        <code>ToolMessage</code>, sets <code>next_step = "agent_node"</code>.</li>
+    <li>Fixed edge <code>add_edge("web_search_node", "agent_node")</code> (no branching, no
+        <code>route_next</code> call here) sends control back to <code>agent_node</code>.</li>
+</ol>
+
+<p><strong>Iteration 2</strong></p>
+<ol start="6">
+    <li><code>agent_node</code> runs <em>again</em> (2nd time) &rarr; sees the new <code>ToolMessage</code> in
+        context &rarr; LLM now decides it needs <code>search_documents</code> &rarr;
+        <code>next_step = "search_documents"</code>.</li>
+    <li>LangGraph calls <code>route_next(state)</code> <strong>again</strong> (fresh call, same function, new
+        state) &rarr; <code>choice == "search_documents"</code> &rarr; returns <code>"route_docs"</code>.</li>
+    <li>Path map: <code>"route_docs"</code> &rarr; <code>"search_documents_node"</code>.</li>
+    <li><code>search_documents_node</code> runs, appends its own <code>ToolMessage</code>, sets
+        <code>next_step = "agent_node"</code>.</li>
+    <li>Fixed edge <code>add_edge("search_documents_node", "agent_node")</code> sends control back to
+        <code>agent_node</code>.</li>
+</ol>
+
+<p><strong>Iteration 3</strong></p>
+<ol start="11">
+    <li><code>agent_node</code> runs a 3rd time &rarr; LLM now has both tool results &rarr; generates final
+        answer &rarr; <code>next_step = "end"</code>.</li>
+    <li><code>route_next(state)</code> &rarr; <code>choice</code> doesn't match
+        <code>"search_documents"</code>/<code>"search_database"</code>/<code>"web_search"</code> &rarr; falls
+        through to <code>return END</code>.</li>
+    <li>Path map: <code>END</code> &rarr; <code>END</code>. Graph stops.</li>
+</ol>
+
+<h3>The two edge types working together</h3>
+<ul>
+    <li>
+        <strong><code>add_conditional_edges("agent_node", route_next, {...})</code></strong> &mdash; this is
+        the <em>only</em> branching point in the whole graph. It fires every single time
+        <code>agent_node</code> finishes, and picks 1 of 4 destinations based on the <strong>current</strong>
+        <code>next_step</code> value in state.
+    </li>
+    <li>
+        <strong><code>add_edge(tool_node, "agent_node")</code></strong> (&times;3, one per tool) &mdash; these
+        are dumb, fixed edges. No decision, no function call &mdash; every tool node always funnels back to
+        <code>agent_node</code>.
+    </li>
+</ul>
+
+<div class="note">
+    <strong>Bottom line:</strong> the "looping" across 2+ different tools isn't special-cased anywhere in the
+    code &mdash; it emerges naturally because <code>agent_node</code> is a cycle re-entry point, and each time
+    you land back on it, the <em>same</em> conditional edge re-evaluates against whatever the LLM decided this
+    time. The loop only terminates when <code>route_next</code> returns <code>END</code>, which only happens
+    when <code>agent_node</code> sets <code>next_step = "end"</code> (i.e., the LLM stopped requesting tools).
+</div>
+
+<h2>6. LangGraph Engine vs. Your Application Code</h2>
+<p>
+    Mixing up "what LangGraph's engine does automatically" vs "what your own Python code decides" is exactly
+    what causes confusion about the loop. Here's the clean split.
+</p>
+
+<h3>What LangGraph (the engine) controls</h3>
+<p>
+    This is generic machinery &mdash; it doesn't know or care about tools, LLMs, or your business logic. It
+    just executes whatever graph structure you built with <code>builder.add_node(...)</code> /
+    <code>add_edge(...)</code> / <code>add_conditional_edges(...)</code>.
+</p>
+<table>
+    <tr><th>LangGraph's job</th><th>Where it happens</th></tr>
+    <tr>
+        <td>Calling a node function with the current <code>state</code></td>
+        <td>e.g. it calls <code>agent_node(state)</code>, <code>web_search_node(state)</code></td>
+    </tr>
+    <tr>
+        <td>Merging whatever dict a node returns into the shared state (using each field's reducer)</td>
+        <td>happens after every node call, automatically</td>
+    </tr>
+    <tr>
+        <td>Persisting the merged state via the checkpointer</td>
+        <td><code>memory = SqliteSaver(conn)</code></td>
+    </tr>
+    <tr>
+        <td>Deciding <strong>which edge type to follow</strong> once a node finishes: fixed
+            (<code>add_edge</code>) or conditional (<code>add_conditional_edges</code>)</td>
+        <td>pure graph structure, decided at <code>builder.add_conditional_edges("agent_node", ...)</code> /
+            <code>builder.add_edge("web_search_node", "agent_node")</code></td>
+    </tr>
+    <tr>
+        <td>If conditional: <strong>calling your router function</strong> (<code>route_next</code>) and using
+            its returned string to look up the path map dict</td>
+        <td><pre>builder.add_conditional_edges(
+    "agent_node",
+    route_next,
+    {
+        "route_docs": "search_documents_node",
+        "route_db": "search_database_node",
+        "route_web": "web_search_node",
+        END: END,
+    },
+)</pre></td>
+    </tr>
+    <tr>
+        <td>If fixed: just going straight to the hardcoded target node, <strong>no function call, no state
+            inspection</strong></td>
+        <td><pre>builder.add_edge("search_documents_node", "agent_node")
+builder.add_edge("search_database_node", "agent_node")
+builder.add_edge("web_search_node", "agent_node")</pre></td>
+    </tr>
+</table>
+<div class="note">
+    <strong>Key point:</strong> LangGraph itself never looks inside <code>state["next_step"]</code>. It has no
+    idea that field exists or what string is in it. The <em>only</em> reason <code>next_step</code> matters at
+    all is because <strong>your own <code>route_next</code> function</strong> happens to read it &mdash;
+    that's your code's decision, not LangGraph's built-in behavior.
+</div>
+
+<h3>What your code (application logic) controls</h3>
+<p>This is everything LangGraph blindly delegates to your functions.</p>
+<table>
+    <tr><th>Your code's job</th><th>Where it happens</th></tr>
+    <tr>
+        <td>Deciding what <code>next_step</code> should be set to</td>
+        <td><code>agent_node</code> sets it to a tool name or <code>"end"</code>;
+            <code>_run_tool_node</code> always sets it to <code>"agent_node"</code> &mdash; but this value is
+            just inert data, not a signal LangGraph acts on</td>
+    </tr>
+    <tr>
+        <td>Interpreting <code>next_step</code> to pick a destination</td>
+        <td><pre>def route_next(state: AgentState):
+    choice = state["next_step"]
+    if choice == "search_documents":
+        return "route_docs"
+    ...</pre> &mdash; this is a plain Python function you wrote; LangGraph
+            only calls it because you registered it via <code>add_conditional_edges</code></td>
+    </tr>
+    <tr>
+        <td>Translating the router's decision key into a real node name</td>
+        <td>the path map dict you passed alongside <code>route_next</code>:
+            <pre>{"route_docs": "search_documents_node", ...}</pre></td>
+    </tr>
+    <tr>
+        <td>Deciding which tool to call, based on the LLM's output</td>
+        <td><code>agent_node</code>'s <code>if response.tool_calls:</code> block</td>
+    </tr>
+    <tr>
+        <td>Actually invoking the tool and wrapping the result</td>
+        <td><code>_run_tool_node</code></td>
+    </tr>
+</table>
+
+<h3>Applying this to <code>web_search_node &rarr; agent_node</code></h3>
+<ul>
+    <li>
+        <code>_run_tool_node</code> sets <code>next_step = "agent_node"</code> &mdash; <strong>this is just
+        your code writing a string into a dict field.</strong> It has zero effect on LangGraph's routing.
+    </li>
+    <li>
+        LangGraph, after running <code>web_search_node</code>, checks its compiled graph structure: does
+        <code>"web_search_node"</code> have a conditional edge? <strong>No</strong> &mdash; only
+        <code>"agent_node"</code> does, via <code>builder.add_conditional_edges("agent_node", route_next, {...})</code>.
+        So it falls through to the plain edge
+        <code>builder.add_edge("web_search_node", "agent_node")</code> &mdash; <strong>this is LangGraph's built-in
+        mechanism</strong>, following a static graph structure decision made at build time, completely
+        independent of anything in <code>state</code>.
+    </li>
+</ul>
+<div class="note">
+    <strong>Correcting the common misconception:</strong> setting <code>next_step = "agent_node"</code> is
+    coincidental/cosmetic here &mdash; it is <em>not</em> what causes the transition. The transition happens
+    purely because of the graph's static edge structure (LangGraph engine), not because LangGraph read that
+    state value (which would be application logic, and in this case, isn't even wired up for tool nodes since
+    they have no conditional edge / router function attached at all).
+</div>
+
+<h2>7. One Conditional Decision Per agent_node Pass</h2>
+<p>
+    Per iteration/turn, <code>agent_node</code>'s conditional edge fires <strong>exactly once</strong> and
+    picks <strong>exactly one</strong> destination out of the 4 options (3 tool nodes or <code>END</code>).
+    It's a single decision per pass, based purely on whatever <code>route_next</code> reads from
+    <code>state["next_step"]</code> at that moment.
+</p>
+<p>To be precise about the mechanism:</p>
+<ol>
+    <li><code>agent_node</code> runs &rarr; its own code sets <code>next_step</code> in the returned dict
+        (based on the LLM's decision &mdash; first tool call name, or <code>"end"</code>).</li>
+    <li>State merges &rarr; <code>state["next_step"]</code> now holds that value.</li>
+    <li>LangGraph calls <code>route_next(state)</code> <strong>once</strong> &rarr; reads
+        <code>state["next_step"]</code> &rarr; returns one decision key (<code>"route_docs"</code> /
+        <code>"route_db"</code> / <code>"route_web"</code> / <code>END</code>).</li>
+    <li>The path map dict resolves that single key to one node &rarr; <strong>only that one node executes</strong>
+        this cycle.</li>
+</ol>
+<div class="note">
+    <strong>So yes</strong> &mdash; one <code>agent_node</code> execution &rarr; one conditional evaluation
+    &rarr; one tool node (or <code>END</code>) executed. This is also exactly why the original bug exists: if
+    the LLM's single response contains <em>multiple</em> tool_calls (e.g. <code>search_documents</code> +
+    <code>web_search</code> in the same turn), <code>next_step</code> only captures
+    <code>response.tool_calls[0]["name"]</code> &mdash; so even though the LLM asked for 2+ tools in one shot,
+    the conditional edge can still only route to <strong>one</strong> node per <code>agent_node</code> pass,
+    leaving the rest to be caught (or missed) on a later loop back through <code>agent_node</code>.
+</div>
 
 </body>
 </html>
