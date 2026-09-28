@@ -59,6 +59,385 @@
 <h1>LangGraph Routing Flow — Reference Notes</h1>
 <p><em>File: <code>langraph_with_multiple_tool.py</code></em></p>
 
+<h2>0. Where State Is Saved and How It Flows</h2>
+<p>
+        <strong>Important correction:</strong> <code>AgentState</code> is <em>not</em> an object/class where values
+        are stored. It is only a <strong>schema/type definition</strong>. It describes which keys a state dictionary
+        may contain:
+</p>
+<pre>class AgentState(TypedDict):
+        query: str
+        messages: Annotated[list, add_messages]
+        intermediate_steps: list[str]
+        tool_output: Optional[str]
+        final_answer: Optional[str]
+        next_step: str</pre>
+<p>
+        The actual values live in LangGraph's runtime state dictionary. Because this graph is compiled with a
+        <code>SqliteSaver</code> checkpointer, LangGraph also saves each merged state checkpoint in
+        <code>rag_checkpoints.sqlite</code>, under the current <code>thread_id</code>.
+</p>
+<pre>memory = SqliteSaver(conn)
+graph = builder.compile(checkpointer=memory)</pre>
+
+<h3>Actual state flow</h3>
+<pre>User question
+    ↓
+ask_question creates initial_state dictionary
+    ↓
+graph.invoke(initial_state, config)
+    ↓
+LangGraph gives current state to agent_node(state)
+    ↓
+agent_node returns an update dictionary
+    ↓
+LangGraph merges update into current state and checkpoints it
+    ↓
+route_next(merged_state) chooses a tool node
+    ↓
+LangGraph gives the same merged state to that tool node
+    ↓
+tool node returns another update dictionary with ToolMessage/result
+    ↓
+LangGraph merges it, checkpoints it, follows fixed edge back to agent_node
+    ↓
+repeat until agent_node causes route_next to return END</pre>
+
+<h3>Step 1: Initial state is created</h3>
+<p>Inside <code>ask_question</code>, the user's question is added to <code>messages</code>:</p>
+<pre>messages.append({"role": "user", "content": question})
+
+initial_state = {"query": question, "messages": messages}
+result = graph.invoke(initial_state, config=config)</pre>
+<p>
+        At this point, it is normal that fields such as <code>tool_output</code>, <code>next_step</code>, and
+        <code>final_answer</code> do not exist yet. Nodes add them later.
+</p>
+
+<h3>Step 2: LangGraph calls <code>agent_node(current_state)</code></h3>
+<p>LangGraph passes the complete current state into the node:</p>
+<pre>def agent_node(state: AgentState):
+        messages = state["messages"]
+        ...</pre>
+<p>
+        The LLM returns either tool calls or a final answer. <code>agent_node</code> then creates an
+        <strong>update</strong>, not a complete replacement state:
+</p>
+<pre>update = {
+        "messages": [response],
+        "intermediate_steps": intermediate_steps,
+        "next_step": next_step,
+        "final_answer": final_answer,
+}
+return update</pre>
+
+<h3>Step 3: LangGraph merges and saves the update</h3>
+<p>
+        LangGraph merges the returned update into its current state. Most fields replace their previous values;
+        for example, <code>next_step</code> may change from <code>None</code> to
+        <code>"search_documents"</code>.
+</p>
+<p><code>messages</code> is special because it uses the <code>add_messages</code> reducer:</p>
+<pre>messages: Annotated[list, add_messages]</pre>
+<p>
+        Therefore, returning <code>{"messages": [response]}</code> appends the new <code>AIMessage</code>
+        rather than replacing the existing conversation history.
+</p>
+<pre>Before agent_node:
+messages = [SystemMessage, HumanMessage]
+
+After agent_node:
+messages = [SystemMessage, HumanMessage, AIMessage(tool_calls=[...])]
+next_step = "search_documents"</pre>
+<p>After merging, <code>SqliteSaver</code> saves the state checkpoint for that thread.</p>
+
+<h3>Step 4: <code>route_next</code> reads the merged state</h3>
+<p>
+        Only after state is merged does LangGraph call <code>route_next(state)</code>. That router receives the
+        latest state, including <code>state["next_step"]</code>, and returns a decision key. The path map then
+        resolves that key to the next node.
+</p>
+
+<h3>Step 5: The selected tool node receives the same current state</h3>
+<p>For example, LangGraph invokes:</p>
+<pre>search_documents_node(state)</pre>
+<p>That wrapper delegates to:</p>
+<pre>_run_tool_node(state, "search_documents")</pre>
+<p>The tool node reads the latest AI tool-call request, invokes the real tool, and returns another partial update:</p>
+<pre>last_message = state["messages"][-1]
+output = tools_by_name[tool_name].invoke(tool_call["args"])
+
+update = {
+        "messages": tool_messages,
+        "tool_output": tool_output,
+        "intermediate_steps": intermediate_steps,
+        "next_step": "agent_node",
+}
+return update</pre>
+<p>
+        LangGraph merges and checkpoints this update. The new <code>ToolMessage</code> is appended to
+        <code>messages</code>, and <code>tool_output</code> becomes the most recent tool result.
+</p>
+
+<h3>Step 6: The fixed edge returns to <code>agent_node</code></h3>
+<p>This return happens because the graph declares a fixed edge:</p>
+<pre>builder.add_edge("search_documents_node", "agent_node")</pre>
+<p>
+        It does <strong>not</strong> happen because the tool node stored <code>next_step = "agent_node"</code>.
+        That value is saved and passed forward, but this fixed edge does not read it. The next
+        <code>agent_node</code> call receives the updated state, including the <code>ToolMessage</code>, and the LLM
+        decides whether another tool is needed or whether it can provide the final answer.
+</p>
+
+<div class="note">
+        <strong>Best mental model:</strong>
+        <ul>
+                <li><code>AgentState</code>: blueprint of possible state keys, <strong>not storage</strong>.</li>
+                <li>LangGraph runtime state: the actual dictionary containing values.</li>
+                <li>Node function: receives current state and returns a <strong>partial update</strong>.</li>
+                <li>LangGraph: merges updates, persists them through <code>SqliteSaver</code>, and moves execution along edges.</li>
+                <li><code>messages</code>: accumulates because of <code>add_messages</code>.</li>
+                <li><code>next_step</code>: only affects routing when <code>route_next</code> reads it after <code>agent_node</code>.</li>
+        </ul>
+</div>
+
+<h2>0.1 How the LLM Chooses a Tool</h2>
+<p>
+    <strong>Important refinement:</strong> <code>agent_node</code> does not decide which tool to call by itself.
+    Inside <code>agent_node</code>, this call asks the <strong>LLM</strong> to decide:
+</p>
+<pre>response = llm_with_tools.invoke(messages)</pre>
+<p>The LLM can return either:</p>
+<ol>
+    <li>a normal final answer, or</li>
+    <li>structured <code>tool_calls</code>, for example:</li>
+</ol>
+<pre>{
+    "name": "search_documents",
+    "args": {"input": "Cloud Engineering manager"}
+}</pre>
+<p>Your Python code then reads the LLM's response:</p>
+<pre>if response.tool_calls:
+    next_step = response.tool_calls[0]["name"]
+else:
+    next_step = "end"</pre>
+
+<h3>Decision chain</h3>
+<pre>User question + system prompt + earlier messages/tool results
+        ↓
+agent_node sends all messages to LLM
+        ↓
+LLM decides: final answer OR tool call(s)
+        ↓
+agent_node converts first requested tool into next_step
+        ↓
+route_next sends graph to that matching tool node</pre>
+
+<h3>How the LLM knows which tool to call</h3>
+<p>This line gives the LLM the available tool definitions:</p>
+<pre>llm_with_tools = groq_llm.bind_tools(tools)</pre>
+<p>And <code>tools</code> contains:</p>
+<pre>tools = [search_documents, search_database, web_search]</pre>
+<p>
+    Each <code>@tool</code> function provides the LLM with a tool name, input schema, and docstring. The LLM
+    uses those descriptions together with the system prompt and the user's question to choose a tool.
+</p>
+
+<h3><code>search_documents</code></h3>
+<p>The tool description directs the LLM to use it for AcmeNova company information, employees, policies, head office, and the Coolie movie.</p>
+<p>Example user question:</p>
+<pre>Who manages Cloud Engineering?</pre>
+<p>
+    The LLM sees “Cloud Engineering” as an AcmeNova employee/company fact, so it can return:
+</p>
+<pre>search_documents(input="Cloud Engineering manager")</pre>
+
+<h3><code>search_database</code></h3>
+<p>The tool description directs the LLM to use it for users, accounts, emails, account status, user counts, and signup data.</p>
+<p>Example user question:</p>
+<pre>How many inactive users are there?</pre>
+<p>Expected LLM tool call:</p>
+<pre>search_database(input="How many inactive users are there?")</pre>
+
+<h3><code>web_search</code></h3>
+<p>The tool description directs the LLM to use it for current information, recent news, or information not in the documents/database.</p>
+<p>Example user question:</p>
+<pre>Who won IPL 2026?</pre>
+<p>Expected LLM tool call:</p>
+<pre>web_search(input="IPL winner 2026")</pre>
+
+<h3>Your system prompt also guides the LLM</h3>
+<p>In <code>ask_question</code>, the system message adds stricter rules:</p>
+<pre>Use search_documents ONLY for AcmeNova company facts.
+Use search_database for users, accounts, emails, or signup data.
+Use web_search for real-world names/current information.</pre>
+<p>So the LLM makes its tool choice using three inputs:</p>
+<pre>1. User question
+2. Tool names + docstrings
+3. Your system prompt rules</pre>
+
+<h3>What happens after a tool response</h3>
+<p>
+    After a tool node returns a <code>ToolMessage</code>, the fixed edge sends execution back to
+    <code>agent_node</code>. The LLM sees the full history again:
+</p>
+<pre>User question
+→ AIMessage requesting tool
+→ ToolMessage containing tool result</pre>
+<p>Then it decides again:</p>
+<pre>Do I have enough information?
+    Yes → return final answer
+    No  → request another tool</pre>
+<p>For example:</p>
+<pre>Question: “IPL winner 2026 and AcmeNova head office?”
+
+agent_node call 1:
+  LLM requests web_search("IPL winner 2026")
+
+web_search_node:
+  returns ToolMessage with IPL result
+
+agent_node call 2:
+  LLM sees IPL result but still needs office location
+  LLM requests search_documents("AcmeNova head office")
+
+search_documents_node:
+  returns ToolMessage with office result
+
+agent_node call 3:
+  LLM sees both results
+  LLM produces final answer</pre>
+
+<div class="note">
+    <strong>Current limitation:</strong> if the LLM requests multiple different tools in <em>one</em> response,
+    this script takes only <code>response.tool_calls[0]["name"]</code>. The graph therefore executes only the
+    first requested tool in that pass.
+</div>
+
+<h2>0.2 What Counts as a Tool-Use Loop</h2>
+<p>The clean terminology is:</p>
+<ul>
+        <li><strong>One graph run:</strong> one <code>graph.invoke(...)</code> call for one user message.</li>
+        <li><strong>One tool-use loop / cycle:</strong> <code>agent_node &rarr; one tool node &rarr; agent_node</code>.</li>
+        <li><strong>Final exit:</strong> the last <code>agent_node</code> runs, produces an answer instead of a tool call, then routes to <code>END</code>.</li>
+</ul>
+<p>For a user question that needs two tools sequentially:</p>
+<pre>User question
+    ↓
+agent_node
+    ↓ LLM asks web_search
+web_search_node
+    ↓ fixed edge
+agent_node
+    ↓ LLM asks search_documents
+search_documents_node
+    ↓ fixed edge
+agent_node
+    ↓ LLM has enough information and answers
+END</pre>
+<p>That graph run contains:</p>
+<ol>
+        <li><strong>Tool-use loop 1:</strong> <code>agent_node &rarr; web_search_node &rarr; agent_node</code></li>
+        <li><strong>Tool-use loop 2:</strong> <code>agent_node &rarr; search_documents_node &rarr; agent_node</code></li>
+        <li><strong>Final agent pass:</strong> <code>agent_node &rarr; END</code></li>
+</ol>
+<div class="note">
+        It is not automatically “first user sub-question = first loop, second user sub-question = second loop.”
+        The LLM decomposes a compound request internally and decides what information it still needs after each
+        <code>ToolMessage</code>. It can also call the <em>same</em> tool twice if the first result is insufficient:
+        <pre>agent_node → search_documents_node → agent_node
+agent_node → search_documents_node → agent_node
+agent_node → END</pre>
+    <p>For a completely new user question, <code>ask_question(...)</code> calls <code>graph.invoke(...)</code> again, starting a <strong>new graph run</strong>. If the <code>thread_id</code> is the same, that new run begins with prior messages/checkpoints in state; if it has a new <code>thread_id</code>, it begins with fresh conversation state.</p>
+</div>
+
+<h2>0.3 What Happens When a Tool Does Not Find an Answer</h2>
+<p>
+        The LLM <strong>can</strong> call another tool after an unsuccessful tool result, but the current graph
+        does not guarantee or enforce that fallback behavior.
+</p>
+<p>For example, suppose the user asks for AcmeNova's head-office address, but the LLM incorrectly chooses:</p>
+<pre>search_database(...)</pre>
+<p>The graph flow is still:</p>
+<pre>agent_node
+    → search_database_node
+    → ToolMessage containing database result / “no result”
+    → fixed edge back to agent_node</pre>
+<p>When <code>agent_node</code> runs again, the LLM receives that database <code>ToolMessage</code> in <code>state["messages"]</code>. It can decide to:</p>
+<ol>
+        <li>Call <code>search_documents</code> instead.</li>
+        <li>Retry <code>search_database</code> with a better query.</li>
+        <li>Call <code>web_search</code>.</li>
+        <li>Produce a final answer.</li>
+</ol>
+<p>Therefore, another tool can be called in the next loop:</p>
+<pre>agent_node
+    → search_database_node
+    → agent_node
+    → search_documents_node
+    → agent_node
+    → END</pre>
+<p>
+    <strong>Is fallback handled explicitly in this script?</strong> No. There is no deterministic rule such
+    as: <code>If database result is empty, automatically call search_documents.</code> The fallback depends
+    on the LLM noticing that the result is missing or insufficient and choosing another tool during its next
+    <code>agent_node</code> call.
+</p>
+<p>Your system prompt helps guide this behavior:</p>
+<pre>Use search_documents ONLY for AcmeNova company facts.
+Use search_database for questions about users, accounts, emails, or signup data.</pre>
+<p>
+    But this is an instruction to the LLM, not enforced routing logic. The prompt also says:
+</p>
+<pre>Do not call both tools for the same sub-question if one tool already returned a clear answer.</pre>
+<p>
+    The key phrase is <strong>"clear answer."</strong> If <code>search_database</code> returns no answer,
+    the LLM is allowed to try another relevant tool. But it may not do so reliably; it could retry the wrong
+    tool or answer without enough evidence.
+</p>
+<h3>Summary</h3>
+<pre>Tool returns useful answer
+  → LLM normally produces final answer
+
+Tool returns missing/unclear answer
+  → LLM may call another tool
+  → but only if the LLM decides to do it
+
+Tool returns error/empty result
+  → there is no explicit fallback rule in current code</pre>
+<div class="note">
+    <strong>Reliability implication:</strong> for reliable fallback, add application-controlled logic after a
+    tool runs. It can detect <code>"No relevant documents were found."</code>, an empty SQL result, or
+    <code>"SQL execution failed"</code>, then route to a defined fallback node.
+</div>
+<p>
+    <strong>What the current code actually does:</strong> <code>_run_tool_node</code> stores the raw result in
+    <code>tool_output</code>, but it does not classify that result as successful, empty, or failed. Each tool
+    node has a fixed <code>add_edge(tool_node, "agent_node")</code>, so it always returns to the LLM. For SQL,
+    an empty query result currently appears inside text such as <code>Query: SELECT ... Result: []</code>; it is
+    not a separate state flag that routing can inspect.
+</p>
+<h3>Deterministic fallback solution</h3>
+<p>
+    This solution is <strong>not implemented</strong> in the current script. Add a result-status field such as
+    <code>tool_status</code> to <code>AgentState</code>, have each tool node set it to
+    <code>"success"</code>, <code>"empty"</code>, or <code>"error"</code>, then attach a conditional edge to
+    the tool node (or to a separate result-check node). That router can select a defined fallback instead of
+    relying on the next LLM decision.
+</p>
+<pre>search_database_node
+    ↓ returns tool_status = "empty"
+result_router
+    ↓ deterministic rule
+search_documents_node  (only when this is an approved fallback)
+    ↓
+agent_node</pre>
+<p>
+    The fallback should be domain-specific: for an AcmeNova company fact, an empty database result could route
+    to <code>search_documents_node</code>; for a user/account question, it should usually return a clear
+    "no matching record" result instead of searching company documents.
+</p>
+
 <div class="note">
     <strong>Core distinction (keep this in mind while reading everything below):</strong>
     <ul>
@@ -432,6 +811,32 @@ builder.add_edge("web_search_node", "agent_node")</pre></td>
     <code>response.tool_calls[0]["name"]</code> &mdash; so even though the LLM asked for 2+ tools in one shot,
     the conditional edge can still only route to <strong>one</strong> node per <code>agent_node</code> pass,
     leaving the rest to be caught (or missed) on a later loop back through <code>agent_node</code>.
+</div>
+
+<h2>8. What Is a Fully Autonomous Agent?</h2>
+<p>
+    A <strong>fully autonomous agent</strong> can pursue a goal with broad independence. It can plan multiple
+    steps, choose actions and tools dynamically, check results, adapt when an action fails, and continue until
+    the goal is complete, subject to permissions, budgets, and safety limits.
+</p>
+<p>For example, given <em>"Plan my trip to Delhi under $800,"</em> an autonomous agent could:</p>
+<ol>
+    <li>Search flights and hotels.</li>
+    <li>Compare the available options against the budget.</li>
+    <li>Revise the plan when prices change or a search fails.</li>
+    <li>Ask only the necessary follow-up questions.</li>
+    <li>Make bookings only when it has the required permission.</li>
+</ol>
+<p>
+    This application is <strong>not fully autonomous</strong>. It is a bounded multi-tool agent: it can use only
+    the three tools you provide, it can follow only the LangGraph paths you define, and it has no explicit,
+    deterministic recovery plan for empty or failed tool results. It also cannot create new tools, grant itself
+    permissions, or take actions outside this graph.
+</p>
+<div class="note">
+    <strong>Better wording for this app:</strong> the LLM reasons over the conversation and tool results, decides
+    which available tool to call, and the LangGraph workflow executes that action. This bounded design is usually
+    easier to test, secure, and explain than a fully autonomous agent.
 </div>
 
 </body>

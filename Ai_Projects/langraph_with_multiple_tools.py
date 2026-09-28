@@ -74,8 +74,7 @@ def search_documents(input: str) -> str:
     Use this tool for questions related to:
 
     - AcmeNova company information (head office, employees, policies, etc.)
-    - Coolie movie
-
+  
     The answer should be based on the retrieved documents.
     """
 
@@ -180,11 +179,24 @@ class AgentState(TypedDict):
     next_step: str
 
 
+def _snapshot(state: dict) -> dict:
+    """Compact view of state for print statements (avoids dumping full message objects)."""
+    messages = state.get("messages") or []
+    return {
+        "num_messages": len(messages),
+        "last_message_type": type(messages[-1]).__name__ if messages else None,
+        "tool_output": state.get("tool_output"),
+        "final_answer": state.get("final_answer"),
+        "next_step": state.get("next_step"),
+    }
+
+
 def agent_node(state: AgentState):
 
     print("\n==============================")
     print("LLM NODE")
     print("==============================")
+    print(f"[STATE] Incoming state (before agent_node runs): {_snapshot(state)}")
 
     messages = state["messages"]
     llm_with_tools = groq_llm.bind_tools(tools)
@@ -199,11 +211,9 @@ def agent_node(state: AgentState):
             print(f"\n\nTool: {tool_call['name']}")
             print(f"Arguments: {tool_call['args']}")
             intermediate_steps.append(f"Called {tool_call['name']} with {tool_call['args']}")
+            
         next_step = response.tool_calls[0]["name"]
         print(f"\n\n[DEBUG] next_step set to FIRST tool only -> '{next_step}'")
-        # if len(response.tool_calls) > 1:
-        #     skipped = [tc["name"] for tc in response.tool_calls[1:]]
-        #     print(f"[DEBUG] These tool_calls will NOT run this cycle: {skipped}")
         final_answer = None
     else:
         print("\nLLM generated final answer.")
@@ -212,12 +222,16 @@ def agent_node(state: AgentState):
 
     print(f"[DEBUG] agent_node returning next_step='{next_step}'")
 
-    return {
+    update = {
         "messages": [response],
         "intermediate_steps": intermediate_steps,
         "next_step": next_step,
         "final_answer": final_answer,
     }
+    merged_preview = {**state, **update, "messages": messages + [response]}
+    print(f"[STATE] Outgoing state (after agent_node merges): {_snapshot(merged_preview)}")
+
+    return update
 
 
 tools_by_name = {t.name: t for t in tools}
@@ -226,6 +240,7 @@ tools_by_name = {t.name: t for t in tools}
 def _run_tool_node(state: AgentState, tool_name: str):
 
     print(f"\n[DEBUG] Entered tool node for: '{tool_name}'")
+    print(f"[STATE] Incoming state (before {tool_name}_node runs): {_snapshot(state)}")
 
     last_message = state["messages"][-1]
     matching_calls = [tc for tc in last_message.tool_calls if tc["name"] == tool_name]
@@ -243,12 +258,16 @@ def _run_tool_node(state: AgentState, tool_name: str):
 
     print(f"[DEBUG] tool node '{tool_name}' done, routing back to agent_node")
 
-    return {
+    update = {
         "messages": tool_messages,
         "tool_output": tool_output,
         "intermediate_steps": intermediate_steps,
         "next_step": "agent_node",
     }
+    merged_preview = {**state, **update, "messages": state["messages"] + tool_messages}
+    print(f"[STATE] Outgoing state (after {tool_name}_node merges): {_snapshot(merged_preview)}")
+
+    return update
 
 
 def search_documents_node(state: AgentState):
@@ -345,8 +364,12 @@ def ask_question(question: str, thread_id: str = "default"):
         })
     messages.append({"role": "user", "content": question})
 
+    initial_state = {"query": question, "messages": messages}
+    print(f"[STATE] INITIAL STATE passed to graph.invoke(): {_snapshot(initial_state)}")
+
     try:
-        result = graph.invoke({"query": question, "messages": messages}, config=config)
+        result = graph.invoke(initial_state, config=config)
+        print(f"[STATE] FINAL STATE returned by graph.invoke(): {_snapshot(result)}")
         final_message = result["messages"][-1]
         answer = final_message.content
 
@@ -376,7 +399,7 @@ if __name__ == "__main__":
     # question = "How many users are there?"
     # question = "latest ipl winner 2026 and the AcmeNova head office location"
     question = "Who manages Cloud Engineering?"
-    thread_id="demo2"
+    thread_id="demo3"
     ask_question(question, thread_id=thread_id)
 
 
@@ -460,7 +483,6 @@ if __name__ == "__main__":
 #     Use this tool for questions related to:
 
 #     - AcmeNova company information (head office, employees, policies, etc.)
-#     - Coolie movie
 
 #     The answer should be based on the retrieved documents.
 #     """
